@@ -1,0 +1,21 @@
+# Build results
+bin/
+obj/
+out/
+
+# User-specific & IDE files
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.sln.docstates
+
+# SQLite local databases
+*.db
+*.db-shm
+*.db-wal
+
+# OS files
+.DS_Store
+Thumbs.db
