@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using TaskTracker.NotificationService.Data;
@@ -8,20 +9,26 @@ using TaskTracker.Shared.Contracts;
 namespace TaskTracker.NotificationService.Controllers;
 
 /// <summary>
-/// Заготовка REST API контролера мікросервісу сповіщень.
-/// Обслуговує синхронні запити від TaskService (Classic режим),
-/// перегляд історії сповіщень та керування симуляцією затримки/збоїв.
+/// REST API контролер мікросервісу сповіщень.
+/// - POST /api/notifications — синхронний прийом сповіщень (Classic режим)
+/// - GET /api/notifications — перегляд історії збережених сповіщень
+/// - GET/PUT /api/notifications/simulation — налаштування затримки та збою для ЛР №3
 /// </summary>
 [ApiController]
 [Route("api/[controller]")]
 public class NotificationsController : ControllerBase
 {
     private readonly NotificationDbContext _db;
+    private readonly INotificationProcessor _processor;
     private readonly SimulationOptions _simulation;
 
-    public NotificationsController(NotificationDbContext db, SimulationOptions simulation)
+    public NotificationsController(
+        NotificationDbContext db,
+        INotificationProcessor processor,
+        SimulationOptions simulation)
     {
         _db = db;
+        _processor = processor;
         _simulation = simulation;
     }
 
@@ -36,36 +43,37 @@ public class NotificationsController : ControllerBase
         return Ok(items);
     }
 
+    [HttpDelete]
+    public async Task<IActionResult> ClearAll(CancellationToken cancellationToken)
+    {
+        var all = await _db.Notifications.ToListAsync(cancellationToken);
+        _db.Notifications.RemoveRange(all);
+        await _db.SaveChangesAsync(cancellationToken);
+        return NoContent();
+    }
+
     [HttpPost]
     public async Task<ActionResult<NotificationLog>> SendSync(
         [FromBody] SendNotificationRequest request,
         CancellationToken cancellationToken)
     {
-        if (_simulation.DelayMs > 0)
+        try
         {
-            await Task.Delay(_simulation.DelayMs, cancellationToken);
+            var log = await _processor.ProcessAsync(
+                request.TaskId,
+                request.Recipient,
+                request.EventType,
+                request.Message,
+                CommunicationMode.Classic,
+                cancellationToken);
+
+            return CreatedAtAction(nameof(GetAll), new { id = log.Id }, log);
         }
-
-        if (_simulation.SimulateFailure)
+        catch (InvalidOperationException ex)
         {
-            return StatusCode(StatusCodes.Status500InternalServerError,
-                "Симульований збій NotificationService (для тестування трасування помилок).");
+            Activity.Current?.SetStatus(ActivityStatusCode.Error, ex.Message);
+            return StatusCode(StatusCodes.Status500InternalServerError, new { error = ex.Message });
         }
-
-        var log = new NotificationLog
-        {
-            TaskId = request.TaskId,
-            Recipient = request.Recipient,
-            EventType = request.EventType,
-            Message = request.Message,
-            DeliveryMode = CommunicationMode.Classic,
-            CreatedAt = DateTime.UtcNow
-        };
-
-        _db.Notifications.Add(log);
-        await _db.SaveChangesAsync(cancellationToken);
-
-        return CreatedAtAction(nameof(GetAll), new { id = log.Id }, log);
     }
 
     [HttpGet("simulation")]

@@ -1,47 +1,40 @@
+using System.Diagnostics;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.EntityFrameworkCore;
-using TaskTracker.TaskService.Data;
-using TaskTracker.TaskService.Domain;
+using TaskTracker.Shared.Contracts;
 using TaskTracker.TaskService.Dto;
+using TaskTracker.TaskService.Services;
 
 namespace TaskTracker.TaskService.Controllers;
 
 /// <summary>
-/// Заготовка REST API контролера для мікросервісу завдань.
-/// На наступному етапі сюди буде підключено Classic REST та Event-Driven (RabbitMQ) сценарії.
+/// REST API контролер мікросервісу завдань (TaskService).
+/// Підтримує виконання бізнес-сценаріїв у двох режимах: Classic (REST) та EventDriven (RabbitMQ).
 /// </summary>
 [ApiController]
 [Route("api/[controller]")]
 public class TasksController : ControllerBase
 {
-    private readonly TaskDbContext _db;
+    private readonly ITaskAppService _taskService;
+    private readonly ILogger<TasksController> _logger;
 
-    public TasksController(TaskDbContext db)
+    public TasksController(ITaskAppService taskService, ILogger<TasksController> logger)
     {
-        _db = db;
+        _taskService = taskService;
+        _logger = logger;
     }
 
     [HttpGet]
     public async Task<ActionResult<IEnumerable<TaskResponse>>> GetAll(CancellationToken cancellationToken)
     {
-        var items = await _db.Tasks
-            .OrderByDescending(t => t.CreatedAt)
-            .Select(t => MapToResponse(t, 0))
-            .ToListAsync(cancellationToken);
-
+        var items = await _taskService.GetAllAsync(cancellationToken);
         return Ok(items);
     }
 
     [HttpGet("{id:guid}")]
     public async Task<ActionResult<TaskResponse>> GetById(Guid id, CancellationToken cancellationToken)
     {
-        var item = await _db.Tasks.FindAsync([id], cancellationToken);
-        if (item is null)
-        {
-            return NotFound();
-        }
-
-        return Ok(MapToResponse(item, 0));
+        var item = await _taskService.GetByIdAsync(id, cancellationToken);
+        return item is null ? NotFound() : Ok(item);
     }
 
     [HttpPost]
@@ -51,24 +44,29 @@ public class TasksController : ControllerBase
     {
         if (string.IsNullOrWhiteSpace(request.Title))
         {
-            return BadRequest("Назва завдання обов'язкова.");
+            return BadRequest(new { error = "Назва завдання обов'язкова." });
         }
 
-        var item = new TaskItem
+        var sw = Stopwatch.StartNew();
+        try
         {
-            Title = request.Title.Trim(),
-            Description = request.Description.Trim(),
-            Assignee = string.IsNullOrWhiteSpace(request.Assignee) ? "Unassigned" : request.Assignee.Trim(),
-            Priority = request.Priority,
-            Status = TaskItemStatus.New,
-            CreatedAt = DateTime.UtcNow
-        };
+            var created = await _taskService.CreateAsync(request, cancellationToken);
+            return CreatedAtAction(nameof(GetById), new { id = created.Id }, created);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        {
+            sw.Stop();
+            Activity.Current?.SetStatus(ActivityStatusCode.Error, ex.Message);
+            Activity.Current?.SetTag("error", true);
+            _logger.LogError(ex, "[TaskService] Синхронний збій при створенні завдання у режимі {Mode}.", request.Mode);
 
-        _db.Tasks.Add(item);
-        await _db.SaveChangesAsync(cancellationToken);
-
-        // TODO (наступний крок): викликати NotificationService у режимі Classic REST або опублікувати подію у RabbitMQ.
-        return CreatedAtAction(nameof(GetById), new { id = item.Id }, MapToResponse(item, 0));
+            return StatusCode(StatusCodes.Status502BadGateway, new
+            {
+                error = $"Збій синхронного виклику NotificationService (операцію відкочено): {ex.Message}",
+                mode = request.Mode.ToString(),
+                elapsedMs = sw.ElapsedMilliseconds
+            });
+        }
     }
 
     [HttpPut("{id:guid}/status")]
@@ -77,46 +75,60 @@ public class TasksController : ControllerBase
         [FromBody] ChangeTaskStatusRequest request,
         CancellationToken cancellationToken)
     {
-        var item = await _db.Tasks.FindAsync([id], cancellationToken);
-        if (item is null)
+        var sw = Stopwatch.StartNew();
+        try
         {
-            return NotFound();
+            var updated = await _taskService.ChangeStatusAsync(id, request, cancellationToken);
+            return updated is null ? NotFound() : Ok(updated);
         }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        {
+            sw.Stop();
+            Activity.Current?.SetStatus(ActivityStatusCode.Error, ex.Message);
+            Activity.Current?.SetTag("error", true);
+            _logger.LogError(ex, "[TaskService] Синхронний збій при зміні статусу завдання {TaskId}.", id);
 
-        item.Status = request.NewStatus;
-        item.UpdatedAt = DateTime.UtcNow;
-        await _db.SaveChangesAsync(cancellationToken);
-
-        // TODO (наступний крок): надіслати сповіщення про зміну статусу (Classic або EventDriven).
-        return Ok(MapToResponse(item, 0));
+            return StatusCode(StatusCodes.Status502BadGateway, new
+            {
+                error = $"Збій синхронного виклику NotificationService (зміну статусу відкочено): {ex.Message}",
+                mode = request.Mode.ToString(),
+                elapsedMs = sw.ElapsedMilliseconds
+            });
+        }
     }
 
     [HttpDelete("{id:guid}")]
-    public async Task<IActionResult> Delete(Guid id, CancellationToken cancellationToken)
+    public async Task<IActionResult> Delete(
+        Guid id,
+        [FromQuery] CommunicationMode mode = CommunicationMode.EventDriven,
+        [FromQuery] string reason = "Видалено користувачем",
+        CancellationToken cancellationToken = default)
     {
-        var item = await _db.Tasks.FindAsync([id], cancellationToken);
-        if (item is null)
+        var sw = Stopwatch.StartNew();
+        try
         {
-            return NotFound();
+            var deleted = await _taskService.DeleteAsync(id, mode, reason, cancellationToken);
+            if (!deleted)
+            {
+                return NotFound();
+            }
+
+            sw.Stop();
+            return Ok(new { deleted = true, mode = mode.ToString(), elapsedMs = sw.ElapsedMilliseconds });
         }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        {
+            sw.Stop();
+            Activity.Current?.SetStatus(ActivityStatusCode.Error, ex.Message);
+            Activity.Current?.SetTag("error", true);
+            _logger.LogError(ex, "[TaskService] Синхронний збій при видаленні завдання {TaskId}.", id);
 
-        _db.Tasks.Remove(item);
-        await _db.SaveChangesAsync(cancellationToken);
-
-        // TODO (наступний крок): опублікувати критичну подію TaskDeleted.
-        return NoContent();
+            return StatusCode(StatusCodes.Status502BadGateway, new
+            {
+                error = $"Збій синхронного виклику NotificationService (видалення відкочено): {ex.Message}",
+                mode = mode.ToString(),
+                elapsedMs = sw.ElapsedMilliseconds
+            });
+        }
     }
-
-    private static TaskResponse MapToResponse(TaskItem item, long elapsedMs) => new()
-    {
-        Id = item.Id,
-        Title = item.Title,
-        Description = item.Description,
-        Assignee = item.Assignee,
-        Priority = item.Priority,
-        Status = item.Status,
-        CreatedAt = item.CreatedAt,
-        UpdatedAt = item.UpdatedAt,
-        ElapsedMs = elapsedMs
-    };
 }

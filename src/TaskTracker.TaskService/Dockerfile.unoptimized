@@ -1,0 +1,31 @@
+# ==============================================================================
+# НЕОПТИМІЗОВАНИЙ одноступеневий Dockerfile для TaskService (для порівняння у ЛР №4)
+# Уся збірка і запуск відбуваються в одному важкому образі .NET 8 SDK (~900 МБ),
+# тому у фінальний образ потрапляють вихідний код, NuGet-кеш та інструменти збірки.
+# ==============================================================================
+
+# Єдина стадія на базі повного образу .NET 8 SDK
+FROM mcr.microsoft.com/dotnet/sdk:8.0
+
+# Робоча директорія всередині контейнера
+WORKDIR /src
+
+# Копіюємо весь код проєкту одразу (погіршує кешування шарів)
+COPY src/TaskTracker.Shared/ src/TaskTracker.Shared/
+COPY src/TaskTracker.TaskService/ src/TaskTracker.TaskService/
+
+# Відновлюємо залежності та публікуємо проєкт у цьому ж образі
+RUN dotnet publish src/TaskTracker.TaskService/TaskTracker.TaskService.csproj \
+    -c Release \
+    -o /app/publish
+
+# Переходимо в директорію з публікацією та створюємо каталог для SQLite
+WORKDIR /app/publish
+RUN mkdir -p /app/publish/data
+
+# Налаштовуємо порт прослуховування
+ENV ASPNETCORE_URLS=http://+:8080
+EXPOSE 8080
+
+# Запускаємо застосунок у важкому SDK-образі
+ENTRYPOINT ["dotnet", "TaskTracker.TaskService.dll"]

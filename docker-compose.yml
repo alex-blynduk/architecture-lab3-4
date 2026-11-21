@@ -1,0 +1,104 @@
+# ==============================================================================
+# Docker Compose конфігурація для TaskTracker (ЛР №3 та ЛР №4)
+#
+# Базовий запуск (рівно 3 контейнери, оптимізовано під 8 ГБ ОЗП):
+#   docker compose up --build
+#
+# Запуск із Jaeger для візуалізації трасувань OpenTelemetry (ЛР №3):
+#   docker compose --profile tracing up --build
+# ==============================================================================
+
+services:
+  # ----------------------------------------------------------------------------
+  # 1. Брокер повідомлень RabbitMQ (з веб-інтерфейсом керування)
+  # ----------------------------------------------------------------------------
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: tasktracker-rabbitmq
+    ports:
+      - "5672:5672"     # Порт AMQP для підключення мікросервісів
+      - "15672:15672"   # Веб-консоль керування RabbitMQ (guest / guest)
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    healthcheck:
+      # Легка перевірка готовності портів AMQP (5672) та Management UI (15672) без запуску додаткової Erlang VM
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 5672 && nc -z 127.0.0.1 15672"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    mem_limit: 384m
+
+  # ----------------------------------------------------------------------------
+  # 2. Мікросервіс сповіщень NotificationService (REST + RabbitMQ Consumer)
+  # ----------------------------------------------------------------------------
+  notification-service:
+    build:
+      context: .
+      dockerfile: src/TaskTracker.NotificationService/Dockerfile
+    image: tasktracker-notification-service:optimized
+    container_name: tasktracker-notification-service
+    ports:
+      - "5002:8080"     # Зовнішній доступ до Swagger і REST API сповіщень
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ConnectionStrings__DefaultConnection: Data Source=/app/data/notifications.db
+      RabbitMQ__Host: rabbitmq
+      RabbitMQ__Port: 5672
+      RabbitMQ__User: guest
+      RabbitMQ__Pass: guest
+      OpenTelemetry__OtlpEndpoint: http://jaeger:4317
+    volumes:
+      - notification_data:/app/data
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    mem_limit: 192m
+
+  # ----------------------------------------------------------------------------
+  # 3. Мікросервіс завдань TaskService (REST API + Web UI)
+  # ----------------------------------------------------------------------------
+  task-service:
+    build:
+      context: .
+      dockerfile: src/TaskTracker.TaskService/Dockerfile
+    image: tasktracker-task-service:optimized
+    container_name: tasktracker-task-service
+    ports:
+      - "5001:8080"     # Web UI (http://localhost:5001) та Swagger (/swagger)
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ConnectionStrings__DefaultConnection: Data Source=/app/data/tasks.db
+      Services__NotificationServiceUrl: http://notification-service:8080
+      RabbitMQ__Host: rabbitmq
+      RabbitMQ__Port: 5672
+      RabbitMQ__User: guest
+      RabbitMQ__Pass: guest
+      OpenTelemetry__OtlpEndpoint: http://jaeger:4317
+    volumes:
+      - task_data:/app/data
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      notification-service:
+        condition: service_started
+    mem_limit: 192m
+
+  # ----------------------------------------------------------------------------
+  # 4. (Опційно, профіль tracing) Jaeger — візуалізація трасувань OpenTelemetry
+  # ----------------------------------------------------------------------------
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    container_name: tasktracker-jaeger
+    profiles: ["tracing"]
+    ports:
+      - "16686:16686"   # Веб-інтерфейс Jaeger UI (http://localhost:16686)
+      - "4317:4317"     # OTLP gRPC приймач трасувань від мікросервісів
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    mem_limit: 192m
+
+# Іменовані томи Docker для збереження ізольованих SQLite баз даних (Database-per-Service)
+volumes:
+  task_data:
+  notification_data:
